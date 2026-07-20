@@ -37,6 +37,7 @@ USAGE:
   $0 <URL> <start> <end> [output_name] [options]
   $0 --local <file.mp4> <start> <end> [output_name] [options]
   $0 <URL> --info
+  $0 <URL> --full [output_name] [options]
 
   <start> and <end> accept seconds, MM:SS, or HH:MM:SS (e.g. 90, 1:30, 00:01:30).
 
@@ -50,17 +51,20 @@ OPTIONS:
       --local FILE     Use a previously downloaded local file instead of a URL
   -i, --info           Only print video info (title, duration, formats, ...) and exit.
                         No start/end/output needed.
+      --full           Download the entire video (no clipping) as <output_name>.mp4.
+                        No start/end needed.
   -h, --help           Show this help and exit
 
-Note: when a full video download is required (livestream/DVR sources), the
-downloaded file is always kept (as __full_<output_name>.mp4) so it can be
-reused for future clips without re-downloading.
+Note: when a full video download is required for clipping (livestream/DVR
+sources), the downloaded file is always kept (as __full_<output_name>.mp4)
+so it can be reused for future clips without re-downloading.
 
 EXAMPLES:
   $0 "https://youtu.be/QACEW_vGBgw" --info
   $0 "https://youtu.be/QACEW_vGBgw" 90 150 clip
   $0 "https://youtu.be/QACEW_vGBgw" 1:30 2:30 clip
   $0 "https://youtu.be/QACEW_vGBgw" 00:01:30 00:02:30 clip -f 720
+  $0 "https://youtu.be/QACEW_vGBgw" --full whole-video
   $0 --local __full_clip.mp4 90 150 clip2
 EOF
 }
@@ -70,12 +74,114 @@ is_manifest_url() {
   [[ "$1" == *"manifest"* || "$1" == *"/api/manifest"* || "$1" == *.m3u8* ]]
 }
 
+h264_fmt() {
+  # Prints a format selector that prefers H.264 video + AAC audio, optionally
+  # capped at height $1. YouTube often also serves VP9/Opus at the same
+  # resolution, and yt-dlp's default sort can pick that over H.264 even when
+  # both are available — VP9/Opus muxed into .mp4 plays fine on Linux
+  # (ffplay/VLC/mpv) but not in QuickTime/most native macOS/iOS players,
+  # which only decode H.264+AAC. We fall back to whatever's best if H.264
+  # truly isn't available (e.g. 4K/8K-only sources).
+  local cap=""
+  [[ -n "${1:-}" ]] && cap="[height<=$1]"
+  echo "bestvideo[vcodec^=avc1]${cap}+bestaudio[acodec^=mp4a]/best[vcodec^=avc1][acodec^=mp4a]${cap}/bestvideo${cap}+bestaudio/best${cap}"
+}
+
+audio_fmt() {
+  # AAC (.m4a) audio plays natively everywhere; Opus (the other common
+  # bestaudio pick) doesn't on some players/devices.
+  echo "bestaudio[ext=m4a]/bestaudio"
+}
+
+select_format() {
+  # Sets the global FMT, either from $FMT_ARG (non-interactive) or by
+  # listing formats and prompting. Requires $URL to be set.
+  if [[ -n "$FMT_ARG" ]]; then
+    case "$FMT_ARG" in
+      best)  FMT=$(h264_fmt) ;;
+      1080)  FMT=$(h264_fmt 1080) ;;
+      720)   FMT=$(h264_fmt 720) ;;
+      480)   FMT=$(h264_fmt 480) ;;
+      240)   FMT=$(h264_fmt 240) ;;
+      audio) FMT=$(audio_fmt) ;;
+      *)     FMT="$FMT_ARG" ;;
+    esac
+    info "Using format: $FMT (from --format)"
+  else
+    info "Fetching available formats..."
+    yt-dlp --list-formats --no-playlist "$URL" 2>&1
+    echo ""
+
+    echo "Choose a quality preset:"
+    echo "  1) Best quality  (highest res + best audio, prefers H.264/AAC for compatibility)"
+    echo "  2) 1080p         (1920x1080 + audio)"
+    echo "  3) 720p          (1280x720  + audio)"
+    echo "  4) 480p          (854x480   + audio)"
+    echo "  5) 240p          (426x240   + audio)  ← fastest download"
+    echo "  6) Audio only"
+    echo "  7) Custom        (enter format IDs manually)"
+    echo ""
+    read -rp "Selection [1-7]: " CHOICE
+
+    case "$CHOICE" in
+      1) FMT=$(h264_fmt) ;;
+      2) FMT=$(h264_fmt 1080) ;;
+      3) FMT=$(h264_fmt 720) ;;
+      4) FMT=$(h264_fmt 480) ;;
+      5) FMT=$(h264_fmt 240) ;;
+      6) FMT=$(audio_fmt) ;;
+      7) read -rp "Enter format IDs (e.g. 299+140): " FMT ;;
+      *) die "Invalid selection" ;;
+    esac
+
+    info "Using format: $FMT"
+  fi
+}
+
+yt_dlp_binary_asset() {
+  # Prints the GitHub release asset name for a standalone yt-dlp binary on
+  # this platform, or nothing if unsupported (caller falls back to a package
+  # manager). The standalone binary bundles its own Python, so it isn't
+  # capped by an old system Python the way pip/pipx installs are.
+  case "$(uname -s)" in
+    Linux)
+      case "$(uname -m)" in
+        x86_64)         echo "yt-dlp_linux" ;;
+        aarch64|arm64)  echo "yt-dlp_linux_aarch64" ;;
+      esac
+      ;;
+    Darwin) echo "yt-dlp_macos" ;;
+  esac
+}
+
+deno_release_triple() {
+  # Prints the GitHub release target triple for a standalone deno binary on
+  # this platform, or nothing if unsupported.
+  case "$(uname -s)" in
+    Linux)
+      case "$(uname -m)" in
+        x86_64)         echo "x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64)  echo "aarch64-unknown-linux-gnu" ;;
+      esac
+      ;;
+    Darwin)
+      case "$(uname -m)" in
+        x86_64) echo "x86_64-apple-darwin" ;;
+        arm64)  echo "aarch64-apple-darwin" ;;
+      esac
+      ;;
+  esac
+}
+
 install_cmd_for() {
   # Prints a shell command to install $1, or nothing if no known method exists.
   local cmd="$1"
   case "$cmd" in
     yt-dlp)
-      if command -v pipx &>/dev/null; then echo "pipx install yt-dlp"
+      local asset; asset=$(yt_dlp_binary_asset)
+      if [[ -n "$asset" ]]; then
+        echo "mkdir -p \"$HOME/.local/bin\" && curl -fL -o \"$HOME/.local/bin/yt-dlp\" \"https://github.com/yt-dlp/yt-dlp/releases/latest/download/$asset\" && chmod +x \"$HOME/.local/bin/yt-dlp\""
+      elif command -v pipx &>/dev/null; then echo "pipx install yt-dlp"
       elif command -v brew &>/dev/null; then echo "brew install yt-dlp"
       elif command -v pip3 &>/dev/null; then echo "pip3 install --user yt-dlp"
       elif command -v apt-get &>/dev/null; then echo "sudo apt-get install -y yt-dlp"
@@ -89,6 +195,11 @@ install_cmd_for() {
       elif command -v dnf &>/dev/null; then echo "sudo dnf install -y ffmpeg"
       elif command -v pacman &>/dev/null; then echo "sudo pacman -S --noconfirm ffmpeg"
       fi
+      ;;
+    deno)
+      local triple; triple=$(deno_release_triple)
+      [[ -z "$triple" ]] && return
+      echo "mkdir -p \"$HOME/.local/bin\" && tmp=\$(mktemp -d) && curl -fL -o \"\$tmp/deno.zip\" \"https://github.com/denoland/deno/releases/latest/download/deno-${triple}.zip\" && unzip -o -q \"\$tmp/deno.zip\" -d \"\$tmp\" && mv \"\$tmp/deno\" \"$HOME/.local/bin/deno\" && chmod +x \"$HOME/.local/bin/deno\" && rm -rf \"\$tmp\""
       ;;
   esac
 }
@@ -107,9 +218,40 @@ require() {
 
     info "Installing $cmd..."
     eval "$install_cmd" || die "Failed to install '$cmd'. Please install it manually."
-    command -v "$cmd" &>/dev/null || die "'$cmd' still not found after installation (you may need to restart your shell for PATH changes to take effect)."
+    hash -r
+    command -v "$cmd" &>/dev/null || die "'$cmd' still not found after installation (you may need to add \$HOME/.local/bin to PATH, or restart your shell)."
     info "'$cmd' installed successfully."
   done
+}
+
+ensure_js_runtime() {
+  # yt-dlp needs a JS runtime to solve YouTube's signature challenges; without
+  # one, video info/format extraction can fail outright on many videos. Only
+  # check for deno: it's yt-dlp's default-enabled runtime, and in testing
+  # yt-dlp rejected other installed runtimes (e.g. an older Node.js) as
+  # unsupported, so their mere presence isn't a reliable signal. This check
+  # is soft: decline and the script still proceeds, since some videos/sites
+  # don't need it.
+  command -v deno &>/dev/null && return 0
+
+  warn "No JS runtime (deno) found — yt-dlp may fail to fetch some YouTube videos."
+  local install_cmd
+  install_cmd=$(install_cmd_for deno)
+  if [[ -z "$install_cmd" ]]; then
+    warn "Install one manually, e.g. deno: https://docs.deno.com/runtime/getting_started/installation/"
+    return 0
+  fi
+
+  read -rp "[?] Install deno now (recommended)? [y/N]: " CONFIRM
+  if [[ "${CONFIRM,,}" == "y" ]]; then
+    info "Installing deno..."
+    if eval "$install_cmd"; then
+      hash -r
+      info "deno installed successfully."
+    else
+      warn "Failed to install deno automatically; continuing without it."
+    fi
+  fi
 }
 
 # ── parse args ────────────────────────────────────────────────────────────────
@@ -120,11 +262,14 @@ END=""
 OUTNAME=""
 FMT_ARG=""
 INFO_ONLY=false
+FULL_ONLY=false
+POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)      show_help; exit 0 ;;
     -i|--info)      INFO_ONLY=true; shift ;;
+    --full)         FULL_ONLY=true; shift ;;
     --keep)         shift ;; # no-op: full downloads are always kept now
     --local)        LOCAL_FILE="${2:?--local requires a file}"; shift 2 ;;
     --url)          URL="${2:?--url requires a value}"; shift 2 ;;
@@ -133,20 +278,35 @@ while [[ $# -gt 0 ]]; do
     -o|--output)    OUTNAME="${2:?--output requires a value}"; shift 2 ;;
     -f|--format)    FMT_ARG="${2:?--format requires a value}"; shift 2 ;;
     --*)            die "Unknown option: $1 (see --help)" ;;
-    *)
-      if   [[ -z "$URL"   && -z "$LOCAL_FILE" ]]; then URL="$1"
-      elif [[ -z "$START" ]]; then START="$1"
-      elif [[ -z "$END"   ]]; then END="$1"
-      elif [[ -z "$OUTNAME" ]]; then OUTNAME="$1"
-      else die "Unexpected argument: $1 (see --help)"
-      fi
-      shift ;;
+    *)              POSITIONAL+=("$1"); shift ;;
   esac
 done
+
+# Assign leftover positional args in order. Done after the loop (rather than
+# inline) so flag position doesn't matter — e.g. "<url> --full <name>" and
+# "<url> <name> --full" both work. --info and --full skip the start/end slots.
+POS_IDX=0
+if [[ -z "$URL" && -z "$LOCAL_FILE" && $POS_IDX -lt ${#POSITIONAL[@]} ]]; then
+  URL="${POSITIONAL[$POS_IDX]}"; POS_IDX=$((POS_IDX + 1))
+fi
+if [[ "$INFO_ONLY" != "true" && "$FULL_ONLY" != "true" ]]; then
+  if [[ -z "$START" && $POS_IDX -lt ${#POSITIONAL[@]} ]]; then
+    START="${POSITIONAL[$POS_IDX]}"; POS_IDX=$((POS_IDX + 1))
+  fi
+  if [[ -z "$END" && $POS_IDX -lt ${#POSITIONAL[@]} ]]; then
+    END="${POSITIONAL[$POS_IDX]}"; POS_IDX=$((POS_IDX + 1))
+  fi
+fi
+if [[ -z "$OUTNAME" && $POS_IDX -lt ${#POSITIONAL[@]} ]]; then
+  OUTNAME="${POSITIONAL[$POS_IDX]}"; POS_IDX=$((POS_IDX + 1))
+fi
+[[ $POS_IDX -lt ${#POSITIONAL[@]} ]] && die "Unexpected argument: ${POSITIONAL[$POS_IDX]} (see --help)"
 
 OUTNAME="${OUTNAME:-clip}"
 
 [[ -n "$LOCAL_FILE" && -n "$URL" ]] && die "Use either --local or a URL, not both."
+[[ "$INFO_ONLY" == "true" && "$FULL_ONLY" == "true" ]] && die "Use either --info or --full, not both."
+[[ "$FULL_ONLY" == "true" && -n "$LOCAL_FILE" ]] && die "--full is not supported with --local."
 if [[ -z "$LOCAL_FILE" && -z "$URL" ]]; then
   show_help
   exit 1
@@ -156,6 +316,7 @@ fi
 if [[ "$INFO_ONLY" == "true" ]]; then
   [[ -n "$LOCAL_FILE" ]] && die "--info is not supported with --local; run 'ffprobe <file>' instead."
   require yt-dlp
+  ensure_js_runtime
 
   info "Probing video metadata..."
   META=$(yt-dlp --dump-json --no-playlist "$URL" 2>/dev/null) \
@@ -200,6 +361,26 @@ PY
   exit 0
 fi
 
+# ── FULL-DOWNLOAD MODE ────────────────────────────────────────────────────────
+if [[ "$FULL_ONLY" == "true" ]]; then
+  require ffmpeg
+  require yt-dlp
+  ensure_js_runtime
+
+  select_format
+
+  info "Downloading full video → ${OUTNAME}.mp4 ..."
+  yt-dlp \
+    -f "$FMT" \
+    --merge-output-format mp4 \
+    -o "${OUTNAME}.%(ext)s" \
+    --no-playlist \
+    "$URL"
+
+  info "Done → ${OUTNAME}.mp4"
+  exit 0
+fi
+
 [[ -z "$START" || -z "$END" ]] && die "start and end are required (see --help)."
 
 START=$(hms_to_sec "$START")
@@ -213,7 +394,10 @@ END_HMS=$(sec_to_hms "$END")
 info "Clip: $START_HMS → $END_HMS  (${DURATION}s)"
 
 require ffmpeg
-[[ -z "$LOCAL_FILE" ]] && require yt-dlp
+if [[ -z "$LOCAL_FILE" ]]; then
+  require yt-dlp
+  ensure_js_runtime
+fi
 
 # ── trim helper (used by multiple strategies) ─────────────────────────────────
 trim_local() {
@@ -256,46 +440,7 @@ info "Title   : $TITLE"
 info "Was live: $IS_LIVE"
 
 # ── LIST FORMATS + QUALITY SELECTION ─────────────────────────────────────────
-if [[ -n "$FMT_ARG" ]]; then
-  case "$FMT_ARG" in
-    best)  FMT="bestvideo+bestaudio/best" ;;
-    1080)  FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
-    720)   FMT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
-    480)   FMT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
-    240)   FMT="bestvideo[height<=240]+bestaudio/best[height<=240]" ;;
-    audio) FMT="bestaudio" ;;
-    *)     FMT="$FMT_ARG" ;;
-  esac
-  info "Using format: $FMT (from --format)"
-else
-  info "Fetching available formats..."
-  yt-dlp --list-formats --no-playlist "$URL" 2>&1
-  echo ""
-
-  echo "Choose a quality preset:"
-  echo "  1) Best quality  (highest res + best audio)"
-  echo "  2) 1080p         (1920x1080 + audio)"
-  echo "  3) 720p          (1280x720  + audio)"
-  echo "  4) 480p          (854x480   + audio)"
-  echo "  5) 240p          (426x240   + audio)  ← fastest download"
-  echo "  6) Audio only"
-  echo "  7) Custom        (enter format IDs manually)"
-  echo ""
-  read -rp "Selection [1-7]: " CHOICE
-
-  case "$CHOICE" in
-    1) FMT="bestvideo+bestaudio/best" ;;
-    2) FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
-    3) FMT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
-    4) FMT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
-    5) FMT="bestvideo[height<=240]+bestaudio/best[height<=240]" ;;
-    6) FMT="bestaudio" ;;
-    7) read -rp "Enter format IDs (e.g. 299+140): " FMT ;;
-    *) die "Invalid selection" ;;
-  esac
-
-  info "Using format: $FMT"
-fi
+select_format
 
 # ── STRATEGY 1: --download-sections (regular video, fast) ────────────────────
 if [[ "$IS_LIVE" == "false" ]]; then
